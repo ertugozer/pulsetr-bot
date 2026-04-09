@@ -6,3 +6,4 @@ startCommand = "python bot.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 # updated
+# deploy 1775738631959
