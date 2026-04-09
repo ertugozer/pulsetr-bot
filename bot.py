@@ -1,4 +1,4 @@
-import os, time, hashlib, sqlite3, logging, feedparser, tweepy
+import os, time, hashlib, sqlite3, logging, feedparser, tweepy, re
 from anthropic import Anthropic
 from datetime import datetime, timezone
 
@@ -16,6 +16,18 @@ MIN_INTERVAL   = 25
 DAILY_LIMIT    = 14
 CHECK_INTERVAL = 600
 SELF_REPLY_DELAY = 360
+
+# Bu hashtagler algoritmada cok kalabalik ve penalize - KESINLIKLE YASAK
+BANNED_HASHTAGS = [
+    "SonDakika","Sondakika","sondakika",
+    "Son","Dakika",  # yanlis bolunme engellemek icin
+    "Breaking","BreakingNews",
+    "Haber","Haberler","GundemTurkiye",
+    "Turkey","Turkiye","News","TR",
+]
+
+# Izin verilen niş hashtagler (bunlari kullanmasi istenir)
+ALLOWED_HASHTAG_EXAMPLES = "#Ekonomi #Borsa #BIST #Enflasyon #Dolar #Faiz #Deprem #Teknoloji #Yapay Zeka #Enerji #Saglik #Spor #Futbol #Siyaset #Dis Politika #NATO #AB #ABD"
 
 RSS_FEEDS = [
     {"url":"https://www.ntv.com.tr/son-dakika.rss",       "source":"NTV"},
@@ -93,100 +105,128 @@ def fetch_news():
 
 def is_content_sufficient(title, summary):
     combined = (title + " " + summary).lower()
-    # Muglak ve bos haber filtresi
     vague_phrases = [
-        "detaylar icin", "detaylar için", "resmi kaynak", "takip edin",
-        "guncellenecek", "güncellenecek", "aciklama bekleniyor", "açıklama bekleniyor",
-        "bilgi gelecek", "haberleri takip", "daha fazla bilgi",
-        "guncellenecektir", "güncellenecektir", "guncel bilgi", "güncel bilgi",
-        "bilgiler guncel", "bilgiler güncellendi", "bilgileri guncel",
-        "aciklanacak", "açıklanacak", "bekleyiniz"
+        "detaylar icin","detaylar için","resmi kaynak","takip edin",
+        "guncellenecek","güncellenecek","aciklama bekleniyor","açıklama bekleniyor",
+        "bilgi gelecek","haberleri takip","daha fazla bilgi",
+        "guncellenecektir","güncellenecektir","guncel bilgi","güncel bilgi",
+        "bilgiler guncel","bilgileri guncel","aciklanacak","açıklanacak","bekleyiniz"
     ]
     for phrase in vague_phrases:
         if phrase in combined:
             return False
-    # En az somut bir bilgi olmali: sayi, yer, kisi adi, yuzde vb.
-    import re
     has_number = bool(re.search(r'\d', combined))
-    has_location = any(loc in combined for loc in ["istanbul","ankara","izmir","türkiye","turkey","avrupa","abd","rusya","çin","almanya","fransa","irak","suriye","iran"])
-    has_person = any(title_word in combined for title_word in ["erdoğan","erdogan","bakan","başbakan","cumhurbaşkan","trump","putin","zelensky","macron"])
+    has_location = any(loc in combined for loc in ["istanbul","ankara","izmir","türkiye","turkey","avrupa","abd","rusya","çin","almanya","fransa","irak","suriye","iran","israel","israil"])
+    has_person = any(p in combined for p in ["erdoğan","erdogan","bakan","başbakan","cumhurbaşkan","trump","putin","zelensky","macron","netanyahu"])
     if not (has_number or has_location or has_person):
         return False
-    # Cok kisa ozet de atla
     if len(title) < 20:
         return False
     return True
 
-def generate_tweet(client, title, summary, source):
-    h = (datetime.now(timezone.utc).hour + 3) % 24
-
-    if 7 <= h <= 9:
-        fmt_inst = """Liste formati: her madde bullet ile baslasin, max 3 madde, somut veri/rakam kullan.
-Son satirda: 'Kaydet ↗ takip et' yaz."""
-    elif 11 <= h <= 13:
-        fmt_inst = """Kisa somut bilgi ver (rakam, yer, kisi), sonra gercekten merak uyandiran acik uclu soru sor.
-Max 200 karakter. Ornekler: 'Sizce bu nasil etkiler?', 'Bu karar dogru muydu?', 'Sizin bolgenizde nasil?'"""
-    elif 16 <= h <= 17:
-        fmt_inst = """Son dakika formati. Max 110 karakter. Sadece haber icerigi, somut bilgi.
-Baslangica uygun 1 emoji koy."""
-    else:
-        fmt_inst = """Carpici somut bilgiyle basla. Yapici bir yorum veya baglam ekle. Soru ile bitir.
-Max 230 karakter."""
-
-    prompt = f"""Sen Turkce bir haber botu icin tweet yaziyorsun.
-
-Haber basligi: {title}
-Kaynak: {source}
-Ozet: {summary}
-
-FORMAT TALIMATI: {fmt_inst}
-
-KESINLIKLE YASAKLAR (bu kurallari cignersen tweet KULLANICIYA ZARAR VERIR):
-1. URL, link, http, www EKLEME - tweet icinde kesinlikle link olmayacak
-2. "Detaylar icin takip edin", "Resmi kaynaklara bakin", "Bilgi guncellenecek" gibi BOSLUK DOLDURUCU ifadeler kullanma
-3. Haberde somut bilgi (rakam/yer/kisi/olay) yoksa SADECE "YETERSIZ_HABER" yaz, baska hicbir sey yazma
-4. "Like if / RT if" engagement bait kullanma
-5. 3+ hashtag kullanma - max 1-2 nis hashtag
-6. Negatif/kavgaci ton - Grok bunu penalize ediyor
-
-IYI TWEET ORNEKLERI:
-- "Merkez Bankasi politika faizini %42.5'te sabit tuttu. Enflasyonla mucadelede temkinli adim. Piyasalar bu karari nasil karsilayacak? #Ekonomi"
-- "BIST100 bugun %2.3 yukselisle 9.840 puanda kapandi. Son 3 ayin en yuksek seviyesi. Kaydet ↗ #Borsa"
-- "🔴 Bursa'da 4.2 buyuklugunde deprem. AFAD: can kaybi yok."
-
-KOTU TWEET ORNEKLERI (bunlari yazma):
-- "Deprem bilgileri guncellenmistir. Detaylar icin resmi kaynaklari takip edin." (BOS - somut bilgi yok)
-- "Son dakika haberleri icin sayfamizi takip edin" (REKLAM degil haber yaz)
-- "Bilgiler guncellenecektir" (ANLAMSIZ)
-
-Sadece tweeti yaz. Haber yetersizse sadece YETERSIZ_HABER yaz."""
-
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=350,
-        messages=[{"role":"user","content":prompt}]
-    )
-    tweet = resp.content[0].text.strip()
-
-    # Claude yetersiz dedi mi kontrol et
-    if "YETERSIZ_HABER" in tweet or len(tweet) < 30:
+def clean_tweet(tweet):
+    """Tweet kalite kontrolu ve temizligi"""
+    if not tweet or len(tweet) < 20:
         return None
 
-    # Link var mi kontrol et
-    import re
+    # Link kontrolu
     if re.search(r'https?://|www\.', tweet):
-        log.warning("Claude link ekledi, tweet reddedildi.")
+        log.warning("Link detected in tweet, rejecting.")
         return None
+
+    # Yasak hashtag kontrolu - hem tek kelime hem birlesik
+    hashtags_in_tweet = re.findall(r'#(\w+)', tweet)
+    for tag in hashtags_in_tweet:
+        if tag in BANNED_HASHTAGS:
+            log.warning(f"Banned hashtag #{tag} found, removing...")
+            tweet = re.sub(r'#' + tag + r'\b', '', tweet).strip()
+
+    # 3+ hashtag kontrolu - fazlalari sil
+    hashtags_in_tweet = re.findall(r'#\w+', tweet)
+    if len(hashtags_in_tweet) > 2:
+        log.warning(f"Too many hashtags ({len(hashtags_in_tweet)}), keeping first 2.")
+        keep = hashtags_in_tweet[:2]
+        for tag in hashtags_in_tweet[2:]:
+            tweet = tweet.replace(tag, '').strip()
+
+    # Bos alinti/tirnak kontrolu
+    if tweet.count('"') >= 2 and len(tweet) < 80:
+        log.warning("Short quote-only tweet, rejecting.")
+        return None
+
+    # Yetersizlik sinyalleri
+    bad_phrases = ["yetersiz_haber","YETERSIZ_HABER","detaylar için","resmi kaynaklara","takip edin","#Son Dakika","#Son dakika"]
+    for p in bad_phrases:
+        if p.lower() in tweet.lower():
+            log.warning(f"Bad phrase detected: {p}")
+            return None
+
+    tweet = ' '.join(tweet.split())  # fazla bosluk temizle
 
     if len(tweet) > 270:
         tweet = tweet[:267] + "..."
 
     return tweet
 
+def generate_tweet(client, title, summary, source):
+    h = (datetime.now(timezone.utc).hour + 3) % 24
+
+    if 7 <= h <= 9:
+        fmt_inst = "Liste formatı: her madde • ile başlasın, max 3 madde, somut veri/rakam kullan. Son satırda: 'Kaydet ↗ takip et' yaz."
+    elif 11 <= h <= 13:
+        fmt_inst = "Kısa somut bilgi ver (rakam, yer, kişi), sonra gerçekten merak uyandıran açık uçlu soru sor. Max 200 karakter."
+    elif 16 <= h <= 17:
+        fmt_inst = "Son dakika formatı. Max 110 karakter. Sadece haber içeriği, somut bilgi. Başlangıca 1 emoji koy."
+    else:
+        fmt_inst = "Çarpıcı somut bilgiyle başla. Yapıcı bağlam ekle. Soru ile bitir. Max 230 karakter."
+
+    prompt = f"""Sen PulseTR için Türkçe haber tweeti yazıyorsun.
+
+Haber: {title}
+Kaynak: {source}
+Özet: {summary}
+
+Format talimatı: {fmt_inst}
+
+KESIN KURALLAR:
+1. URL/link/http/www YASAK - tweet içinde kesinlikle link olmayacak
+2. Muğlak ifadeler YASAK: "detaylar için", "resmi kaynaklara bakın", "takip edin", "güncellenecek"
+3. Haber yetersizse sadece YETERSIZ_HABER yaz
+4. Max 1-2 hashtag, SADECE niş ve ilgili olanlar: {ALLOWED_HASHTAG_EXAMPLES}
+5. Bu hashtagler KESİNLİKLE YASAK (çok genel, penalize): #SonDakika #Son #Dakika #Haber #Breaking #TR #Turkey
+6. Hashtagleri붙붙 yaz, boşluksuz: #SonDakika DEĞİL, #Ekonomi EVET
+7. Siyasi söylemleri birebir aktarma - olayı tarafsız özetle
+8. Pozitif/yapıcı ton - Grok negatif içeriği kısıtlıyor
+9. "Like if / RT if" YASAK
+
+İYİ TWEET ÖRNEKLERİ:
+- "Merkez Bankası faizi %42.5'te sabit tuttu. Son 6 aydır değişmedi. Sizce doğru karar mı? #Ekonomi"
+- "• BIST100: +%2.3 (9.840 puan)\n• Dolar: 38.4 TL\n• Altın: 3.240 TL\nKaydet ↗ #Borsa"
+- "🔴 Bursa'da 4.2 büyüklüğünde deprem. AFAD: can kaybı yok. #Deprem"
+
+KÖTÜ TWEET ÖRNEKLERİ (bunları yazma):
+- "...dedi. #Son Dakika" (hashtag bölünmüş, genel, penalize)
+- "Detaylar için takip edin" (boş içerik)
+- Erdoğan'ın sözleri tırnak içinde uzun alıntı (siyasi söylem)
+
+Sadece tweeti yaz. Yetersizse YETERSIZ_HABER yaz."""
+
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=350,
+        messages=[{"role":"user","content":prompt}]
+    )
+    raw = resp.content[0].text.strip()
+
+    if "YETERSIZ_HABER" in raw:
+        return None
+
+    return clean_tweet(raw)
+
 def post_tweet(twitter, text):
     try:
         r = twitter.create_tweet(text=text)
-        log.info(f"Tweet: {text[:70]}...")
+        log.info(f"Tweet OK: {text[:70]}...")
         return r.data["id"]
     except tweepy.TweepyException as e:
         log.error(f"Tweet error: {e}")
@@ -202,7 +242,7 @@ def post_reply(twitter, tweet_id, text):
         return False
 
 def run():
-    log.info("PulseTR Bot v3.1 started.")
+    log.info("PulseTR Bot v3.2 started.")
     conn = init_db()
     anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
     twitter = tweepy.Client(
@@ -212,7 +252,6 @@ def run():
 
     while True:
         try:
-            # Bekleyen self-reply'leri gonder
             for tid, url in get_due_replies(conn):
                 post_reply(twitter, tid, f"Kaynak: {url}")
                 delete_reply(conn, tid)
@@ -227,7 +266,7 @@ def run():
 
             if not is_peak():
                 h = (datetime.now(timezone.utc).hour + 3) % 24
-                log.info(f"Off-peak ({h}:xx TR). Sleeping...")
+                log.info(f"Off-peak ({h}:xx TR).")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
@@ -246,16 +285,15 @@ def run():
                 if not item["url"] or not item["title"]: continue
                 if is_posted(conn, item["url"]): continue
 
-                # Icerik kalite filtresi
                 if not is_content_sufficient(item["title"], item["summary"]):
-                    log.info(f"SKIP (vague): {item['title'][:60]}")
-                    mark_posted(conn, item["url"], item["title"])  # tekrar denemesin
+                    log.info(f"SKIP (vague): {item['title'][:50]}")
+                    mark_posted(conn, item["url"], item["title"])
                     continue
 
                 tweet_text = generate_tweet(anthropic, item["title"], item["summary"], item["source"])
 
                 if tweet_text is None:
-                    log.info(f"SKIP (insufficient by Claude): {item['title'][:60]}")
+                    log.info(f"SKIP (rejected): {item['title'][:50]}")
                     mark_posted(conn, item["url"], item["title"])
                     continue
 
